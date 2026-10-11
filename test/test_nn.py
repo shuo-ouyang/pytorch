@@ -11549,24 +11549,41 @@ class TestNNDeviceType(NNTestCase):
                                                      padding_mode=padding_mode, align_corners=False)
             self.assertEqual(sample, torch.zeros([1, 1, 1, 2], device=device, dtype=dtype))
 
-    def test_CTCLoss_empty_target(self, device):
-        dtype = torch.float if torch.device(device).type == 'mps' else torch.double
-
+    @dtypes(torch.float, torch.double)
+    @dtypesIfMPS(torch.float)
+    @parametrize_test("deterministic", [False, True])
+    @parametrize_test("input_lengths", [[50, 50, 50], [50, 35, 20]])
+    def test_CTCLoss_empty_target(self, device, dtype, deterministic, input_lengths):
+        tolerance = 1e-4 if dtype == torch.float else 1e-10
         target_lengths = [0, 0, 0]
-        input_lengths = [50, 50, 50]
         targets = torch.randint(1, 15, (0,), dtype=torch.long, device=device)
-        log_probs = torch.randn(50, 3, 15, dtype=dtype, device=device).log_softmax(2)
-        loss = torch.nn.functional.ctc_loss(log_probs, targets, input_lengths, target_lengths, reduction='none')
+        log_probs = torch.randn(50, 3, 15, dtype=dtype, device=device).log_softmax(2).requires_grad_()
+        with DeterministicGuard(deterministic):
+            loss = F.ctc_loss(log_probs, targets, input_lengths, target_lengths, reduction='none')
+            grad, = torch.autograd.grad(loss.sum(), log_probs)
         self.assertTrue((loss >= 0).all().item())
-        self.assertEqual(-log_probs.sum(0)[:, 0], loss)
+        expected_loss = torch.stack([-log_probs[:length, b, 0].sum() for b, length in enumerate(input_lengths)])
+        self.assertEqual(expected_loss, loss)
+        expected_grad = log_probs.detach().exp()
+        expected_grad[:, :, 0] -= 1
+        for b, length in enumerate(input_lengths):
+            expected_grad[length:, b] = 0
+        self.assertEqual(grad, expected_grad, atol=tolerance, rtol=0)
 
         target_lengths = [0, 9, 0]
-        input_lengths = [50, 50, 50]
         targets = torch.randint(1, 15, (9,), dtype=torch.long, device=device)
-        log_probs = torch.randn(50, 3, 15, dtype=dtype, device=device).log_softmax(2)
-        loss = torch.nn.functional.ctc_loss(log_probs, targets, input_lengths, target_lengths, reduction='none')
+        log_probs = torch.randn(50, 3, 15, dtype=dtype, device=device).log_softmax(2).requires_grad_()
+        with DeterministicGuard(deterministic):
+            loss = F.ctc_loss(log_probs, targets, input_lengths, target_lengths, reduction='none')
+            grad, = torch.autograd.grad(loss.sum(), log_probs)
         self.assertTrue((loss >= 0).all().item())
-        self.assertEqual(-log_probs.sum(0)[[0, 2], 0], loss[[0, 2]])
+        expected_loss = torch.stack([-log_probs[:input_lengths[b], b, 0].sum() for b in [0, 2]])
+        self.assertEqual(expected_loss, loss[[0, 2]])
+        expected_grad = log_probs.detach().exp()
+        expected_grad[:, :, 0] -= 1
+        for b, length in enumerate(input_lengths):
+            expected_grad[length:, b] = 0
+        self.assertEqual(grad[:, [0, 2]], expected_grad[:, [0, 2]], atol=tolerance, rtol=0)
 
     # Merge into OpInfo?
     @skipCUDAIf(True, """Test is flaky on Linux and Windows, typical error message:
@@ -15189,7 +15206,8 @@ class TestNNDeviceType(NNTestCase):
 
     @skipMPS
     @onlyAccelerator
-    def test_CTCLoss_long_targets(self, device):
+    @parametrize_test("deterministic", [False, True])
+    def test_CTCLoss_long_targets(self, device, deterministic):
         input_length = 4000
         vocab_size = 3
         batch_size = 4
@@ -15205,7 +15223,7 @@ class TestNNDeviceType(NNTestCase):
         grad_out = torch.randn_like(res_cpu)
         grad_cpu, = torch.autograd.grad(res_cpu, log_probs, grad_out)
 
-        with torch.backends.cudnn.flags(enabled=False):
+        with torch.backends.cudnn.flags(enabled=False), DeterministicGuard(deterministic):
             res_device = torch.nn.functional.ctc_loss(log_probs.to(device), targets.to(device), input_lengths, target_lengths,
                                                       reduction='sum', zero_infinity=True)
             grad_device, = torch.autograd.grad(res_device, log_probs, grad_out.to(device))
@@ -15229,8 +15247,42 @@ class TestNNDeviceType(NNTestCase):
         res_cpu = torch.nn.functional.ctc_loss(inp.cpu(), target, input_lengths, target_lengths, reduction='none')
         self.assertEqual(res_cpu, res_gpu, atol=1e-3, rtol=0)
 
+    @onlyCUDA
+    @dtypes(torch.float, torch.double)
+    @parametrize_test("shape", [(40, 5, 4), (300, 5, 4), (40, 5, 1000)])
+    @parametrize_test("concatenated", [False, True])
+    def test_CTCLoss_deterministic(self, device, dtype, shape, concatenated):
+        time, batch, classes = shape
+        log_probs = torch.randn(batch, time, classes, device=device, dtype=dtype)
+        log_probs = log_probs.log_softmax(2).transpose(0, 1).detach().requires_grad_()
+        input_lengths = [time] * batch
+        target_lengths = [128] * batch if time == 300 else [5, 8, 16, 12, 12]
+        target_size = 2 * max(target_lengths)
+        targets = torch.randint(0, 2, (batch, target_size), device=device, dtype=torch.long)[:, ::2]
+        if concatenated:
+            targets = torch.cat([target[:length] for target, length in zip(targets, target_lengths)]).int()
+        grad_out = torch.randn(batch * 2, device=device, dtype=dtype)[::2]
+        cpu_input = log_probs.detach().cpu().requires_grad_()
+        cpu_loss = F.ctc_loss(cpu_input, targets.cpu(), input_lengths, target_lengths,
+                              blank=3, reduction='none')
+        cpu_grad, = torch.autograd.grad(cpu_loss, cpu_input, grad_out.cpu())
+        with cudnn.flags(enabled=False), DeterministicGuard(True):
+            loss = F.ctc_loss(log_probs, targets, input_lengths, target_lengths,
+                              blank=3, reduction='none')
+            grad, = torch.autograd.grad(loss, log_probs, grad_out)
+            tolerance = 1e-4 if dtype == torch.float else 1e-10
+            self.assertEqual(loss, cpu_loss, atol=tolerance, rtol=tolerance)
+            self.assertEqual(grad, cpu_grad, atol=tolerance, rtol=tolerance)
+            for _ in range(3):
+                repeated_loss = F.ctc_loss(log_probs, targets, input_lengths, target_lengths,
+                                           blank=3, reduction='none')
+                repeated_grad, = torch.autograd.grad(repeated_loss, log_probs, grad_out)
+                self.assertEqual(loss, repeated_loss, atol=0, rtol=0)
+                self.assertEqual(grad, repeated_grad, atol=0, rtol=0)
+
     @skipMPS
-    def test_CTCLoss_zero_lengths(self, device):
+    @parametrize_test("deterministic", [False, True])
+    def test_CTCLoss_zero_lengths(self, device, deterministic):
         N = 3
         S = 2
         C = 200
@@ -15239,40 +15291,46 @@ class TestNNDeviceType(NNTestCase):
         input_lengths = torch.full(size=(N,), fill_value=0, dtype=torch.int)
         target_lengths = torch.full(size=(N,), fill_value=0, dtype=torch.int)
         inp = torch.randn(T, N, C, dtype=torch.float, device=device).log_softmax(2).requires_grad_()
-        res = torch.nn.functional.ctc_loss(inp, target, input_lengths, target_lengths, reduction='none')
+        with DeterministicGuard(deterministic):
+            res = F.ctc_loss(inp, target, input_lengths, target_lengths, reduction='none')
+            res.sum().backward()
         self.assertTrue((res == 0).all().item())
-        res.sum().backward()
         self.assertTrue((inp.grad == 0).all().item())
         target_lengths = torch.full(size=(N,), fill_value=1, dtype=torch.int)
         inp = torch.randn(T, N, C, dtype=torch.float, device=device).log_softmax(2).requires_grad_()
-        res = torch.nn.functional.ctc_loss(inp, target, input_lengths, target_lengths, reduction='none')
+        with DeterministicGuard(deterministic):
+            res = F.ctc_loss(inp, target, input_lengths, target_lengths, reduction='none')
+            res.sum().backward()
         self.assertTrue((res == torch.inf).all().item())
-        res.sum().backward()
         self.assertTrue((inp.grad == 0).all().item())
 
     @skipMPS
     @onlyAccelerator
-    def test_CTCLoss_zero_infinity(self, device):
+    @parametrize_test("deterministic", [False, True])
+    @parametrize_test("zero_infinity", [False, True])
+    def test_CTCLoss_zero_infinity(self, device, deterministic, zero_infinity):
         target_lengths = [60, 25, 20]
         input_lengths = [50, 50, 50]
         targets = torch.randint(1, 15, (sum(target_lengths),), dtype=torch.int, device=device)
         log_probs = torch.randn(50, 3, 15, dtype=torch.float, device=device).log_softmax(2).requires_grad_()
         res = torch.nn.functional.ctc_loss(log_probs, targets, input_lengths, target_lengths,
-                                           reduction='sum', zero_infinity=True)
+                                           reduction='sum', zero_infinity=zero_infinity)
         with torch.backends.cudnn.flags(enabled=False):
             res2 = torch.nn.functional.ctc_loss(log_probs, targets.to(device).long(), input_lengths, target_lengths,
-                                                reduction='sum', zero_infinity=True)
+                                                reduction='sum', zero_infinity=zero_infinity)
         res_cpu = torch.nn.functional.ctc_loss(log_probs.cpu(), targets.cpu(), input_lengths, target_lengths,
-                                               reduction='sum', zero_infinity=True)
+                                               reduction='sum', zero_infinity=zero_infinity)
 
         self.assertEqual(res2, res, atol=1e-4, rtol=0)
         self.assertEqual(res_cpu, res.cpu(), atol=1e-4, rtol=0)
-        g1, = torch.autograd.grad(res, log_probs)
-        g2, = torch.autograd.grad(res2, log_probs)
-        g3, = torch.autograd.grad(res_cpu, log_probs)
+        with DeterministicGuard(deterministic):
+            g1, = torch.autograd.grad(res, log_probs)
+            g2, = torch.autograd.grad(res2, log_probs)
+            g3, = torch.autograd.grad(res_cpu, log_probs)
         self.assertEqual(g2, g3, atol=1e-4, rtol=0)
         self.assertEqual(g1, g2, atol=1e-4, rtol=0)
-        self.assertTrue((g1 == g1).all().item())  # check that we don't have NaN
+        if zero_infinity:
+            self.assertTrue((g1 == g1).all().item())  # check that we don't have NaN
 
     @skipMPS
     @onlyAccelerator

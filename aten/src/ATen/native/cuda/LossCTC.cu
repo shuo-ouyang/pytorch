@@ -16,6 +16,7 @@
 #include <ATen/TensorOperators.h>
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/DeviceUtils.cuh>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -28,6 +29,7 @@
 #include <ATen/ops/full_like.h>
 #include <ATen/ops/imag.h>
 #include <ATen/ops/logsumexp.h>
+#include <ATen/ops/sort.h>
 #include <ATen/ops/tensor.h>
 #include <ATen/ops/where.h>
 #include <ATen/ops/zeros.h>
@@ -35,6 +37,7 @@
 
 #include <type_traits>
 #include <numeric>
+#include <optional>
 
 namespace at::native {
 
@@ -605,6 +608,122 @@ ctc_loss_zero_padded_gradients(
   }
 
 
+template <typename target_t>
+__global__ void ctc_loss_group_labels_kernel(
+    int64_t* labels, const target_t* targets, const int64_t* target_lengths,
+    const int64_t* target_offsets, int64_t target_stride, int64_t states,
+    int64_t batch_size, int64_t blank, int64_t num_labels) {
+  int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= batch_size * states) {
+    return;
+  }
+  int64_t b = index / states;
+  int64_t s = index % states;
+  labels[index] = s <= 2 * target_lengths[b]
+      ? get_target_prime(targets, target_offsets[b], target_stride, s, blank)
+      : num_labels;
+}
+
+__global__ void ctc_loss_group_offsets_kernel(
+    const int64_t* labels, int64_t* offsets, int64_t* counts,
+    int64_t states, int64_t groups, int64_t batch_size, int64_t num_labels) {
+  int64_t b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= batch_size) {
+    return;
+  }
+  int64_t count = 0;
+  int64_t s = 0;
+  for (; s < states && labels[b * states + s] < num_labels; ++s) {
+    if (s == 0 || labels[b * states + s] != labels[b * states + s - 1]) {
+      offsets[b * (groups + 1) + count++] = s;
+    }
+  }
+  offsets[b * (groups + 1) + count] = s;
+  counts[b] = count;
+}
+
+template <typename scalar_t>
+__global__ void ctc_loss_grad_init_kernel(
+    scalar_t* grad, const scalar_t* log_probs, const scalar_t* grad_out,
+    const scalar_t* nll, const int64_t* input_lengths, int64_t elements,
+    int64_t batch_size, int64_t num_labels, int64_t lp_t_stride,
+    int64_t lp_b_stride, int64_t lp_c_stride, int64_t grad_out_stride,
+    bool zero_infinity) {
+  int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= elements) {
+    return;
+  }
+  int64_t c = index % num_labels;
+  int64_t b = index / num_labels % batch_size;
+  int64_t t = index / (num_labels * batch_size);
+  scalar_t lp = log_probs[t * lp_t_stride + b * lp_b_stride + c * lp_c_stride];
+  grad[index] = t >= input_lengths[b] || (zero_infinity && nll[b] == INFINITY)
+      ? scalar_t(0)
+      : (std::exp(lp) - std::exp(scalar_t(-INFINITY) + nll[b] - lp)) *
+          grad_out[b * grad_out_stride];
+}
+
+template <typename scalar_t>
+__global__ void ctc_loss_collect_deterministic_kernel(
+    scalar_t* grad, const scalar_t* log_probs, const scalar_t* grad_out,
+    const scalar_t* nll, const scalar_t* alpha, const scalar_t* beta,
+    const int64_t* labels, const int64_t* positions, const int64_t* offsets,
+    const int64_t* counts, const int64_t* input_lengths,
+    int64_t time, int64_t groups, int64_t states, int64_t num_labels,
+    int64_t batch_size, int64_t lp_t_stride, int64_t lp_b_stride,
+    int64_t lp_c_stride, int64_t grad_out_stride, bool zero_infinity) {
+  int64_t index = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (index >= batch_size * time * groups) {
+    return;
+  }
+  int lane = threadIdx.x % warpSize;
+  int64_t g = index % groups;
+  int64_t t = index / groups % time;
+  int64_t b = index / (groups * time);
+  if (g >= counts[b] || t >= input_lengths[b] ||
+      (zero_infinity && nll[b] == INFINITY)) {
+    return;
+  }
+  int64_t start = offsets[b * (groups + 1) + g];
+  int64_t end = offsets[b * (groups + 1) + g + 1];
+  int64_t c = labels[b * states + start];
+  int64_t row = (b * time + t) * states;
+  scalar_t maximum = -INFINITY;
+  for (int64_t i = start + lane; i < end; i += warpSize) {
+    int64_t s = positions[b * states + i];
+    scalar_t value = alpha[row + s] + beta[row + s];
+    maximum = value > maximum || std::isnan(value) ? value : maximum;
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    scalar_t value = WARP_SHFL_DOWN(maximum, offset);
+    if (lane < offset && (value > maximum || std::isnan(value))) {
+      maximum = value;
+    }
+  }
+  maximum = WARP_SHFL(maximum, 0);
+  scalar_t sum = 0;
+  if (maximum != -INFINITY) {
+    for (int64_t i = start + lane; i < end; i += warpSize) {
+      int64_t s = positions[b * states + i];
+      sum += std::exp(alpha[row + s] + beta[row + s] - maximum);
+    }
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    scalar_t value = WARP_SHFL_DOWN(sum, offset);
+    if (lane < offset) {
+      sum += value;
+    }
+  }
+  if (lane == 0) {
+    scalar_t lp = log_probs[t * lp_t_stride + b * lp_b_stride + c * lp_c_stride];
+    scalar_t mass = maximum == -INFINITY ? scalar_t(-INFINITY)
+        : std::log(sum) + maximum;
+    grad[(t * batch_size + b) * num_labels + c] =
+        (std::exp(lp) - std::exp(mass + nll[b] - lp)) *
+        grad_out[b * grad_out_stride];
+  }
+}
+
 // The backward. It essentially computes eq 16 by using the above kernels.
 // We don't do a lot of checking as we envision this to be called only when backpropagating through a (well-checked) forward.
 template<typename scalar_t, ScalarType target_scalar_type>
@@ -682,7 +801,46 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
   // Note that for OK problems target length <= input length, so we
   // only consider input length.
   bool is_large = (2*log_probs.size(0)+(24*batch_size)/10+(2*num_labels)/10) > 450;
-  if (is_large) { // large alphabet, large batch
+  if (globalContext().deterministicAlgorithms()) {
+    int64_t states = 2 * max_target_length + 1;
+    int64_t groups = std::min(num_labels, states);
+    auto labels = at::empty({batch_size, states}, targets.options().dtype(kLong));
+    ctc_loss_group_labels_kernel<target_t><<<
+        (labels.numel() + 127) / 128, 128, 0, stream>>>(
+        labels.mutable_data_ptr<int64_t>(), targets.const_data_ptr<target_t>(),
+        target_lengths_t.const_data_ptr<int64_t>(),
+        tg_batch_offsets.const_data_ptr<int64_t>(), tg_target_stride, states,
+        batch_size, BLANK, num_labels);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // Stable sorting fixes the order of states belonging to the same character.
+    auto [sorted_labels, positions] = at::sort(labels, std::optional<bool>(true), 1);
+    auto offsets = at::empty({batch_size, groups + 1}, labels.options());
+    auto counts = at::empty({batch_size}, labels.options());
+    ctc_loss_group_offsets_kernel<<<(batch_size + 127) / 128, 128, 0, stream>>>(
+        sorted_labels.const_data_ptr<int64_t>(), offsets.mutable_data_ptr<int64_t>(),
+        counts.mutable_data_ptr<int64_t>(), states, groups, batch_size, num_labels);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    ctc_loss_grad_init_kernel<scalar_t><<<(grad.numel() + 127) / 128, 128, 0, stream>>>(
+        grad.mutable_data_ptr<scalar_t>(), log_probs.const_data_ptr<scalar_t>(),
+        grad_out.const_data_ptr<scalar_t>(), neg_log_likelihood.const_data_ptr<scalar_t>(),
+        input_lengths_t.const_data_ptr<int64_t>(), grad.numel(), batch_size, num_labels,
+        log_probs.stride(0), log_probs.stride(1), log_probs.stride(2),
+        grad_out.stride(0), zero_infinity);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    int warps_per_block = 128 / at::cuda::warp_size();
+    int64_t outputs = batch_size * log_probs.size(0) * groups;
+    ctc_loss_collect_deterministic_kernel<scalar_t><<<
+        (outputs + warps_per_block - 1) / warps_per_block, 128, 0, stream>>>(
+        grad.mutable_data_ptr<scalar_t>(), log_probs.const_data_ptr<scalar_t>(),
+        grad_out.const_data_ptr<scalar_t>(), neg_log_likelihood.const_data_ptr<scalar_t>(),
+        log_alpha.const_data_ptr<scalar_t>(), log_beta.const_data_ptr<scalar_t>(),
+        sorted_labels.const_data_ptr<int64_t>(), positions.const_data_ptr<int64_t>(),
+        offsets.const_data_ptr<int64_t>(), counts.const_data_ptr<int64_t>(),
+        input_lengths_t.const_data_ptr<int64_t>(), log_probs.size(0), groups, states,
+        num_labels, batch_size, log_probs.stride(0), log_probs.stride(1),
+        log_probs.stride(2), grad_out.stride(0), zero_infinity);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else if (is_large) { // large alphabet, large batch
     // this computes the probs, minuend in (16)
     at::exp_out(grad, log_probs);
     // now we compute the subtrahend for the blanks. It is a straightforward reduction because we know that
@@ -799,9 +957,6 @@ std::tuple<Tensor, Tensor> ctc_loss_gpu(const Tensor& log_probs, const Tensor& t
 
 Tensor ctc_loss_backward_gpu(const Tensor& grad, const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths,
                              const Tensor& neg_log_likelihood, const Tensor& log_alpha, int64_t BLANK, bool zero_infinity) {
-  // See Note [Writing Nondeterministic Operations]
-  // Nondeterministic because of atomicAdd usage
-  globalContext().alertNotDeterministic("ctc_loss_backward_gpu");
   return AT_DISPATCH_FLOATING_TYPES(log_probs.scalar_type(), "ctc_loss_backward_cuda", [&] {
       if (targets.scalar_type() == kLong) {
         return ctc_loss_backward_gpu_template<scalar_t, kLong>(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, BLANK, zero_infinity);

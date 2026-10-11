@@ -1689,7 +1689,7 @@ class TestTorchDeviceType(TestCase):
         self.check_nondeterministic_alert(
             lambda: res.backward(grad, retain_graph=True),
             'ctc_loss_backward_gpu',
-            torch.device(device).type == 'cuda')
+            False)
 
     @skipIfTorchInductor("https://github.com/pytorch/pytorch/issues/113707")
     def test_nondeterministic_alert_EmbeddingBag_max(self, device):
