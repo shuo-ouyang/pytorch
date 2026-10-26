@@ -1,4 +1,5 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/Context.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/Dispatch.h>
 #include <ATen/OpMathType.h>
@@ -9,6 +10,7 @@
 #include <ATen/native/cuda/MiscUtils.h>
 #include <ATen/native/sparse/SparseBlasImpl.h>
 #include <ATen/native/sparse/cuda/SparseBlasImpl.h>
+#include <ATen/native/sparse/cuda/SparseCUDABlas.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -560,7 +562,26 @@ void spmm(
 
   // TODO: update this to support COO sparse layout
   auto descA = at::cuda::sparse::CuSparseSpMatCsrDescriptor(mat1);
+
+  // See Note [Enabling Deterministic Operations]
+  const bool deterministic = at::globalContext().deterministicAlgorithms();
+  const bool batched = result_->dim() > 2;
+  const bool single_column = result_->size(-1) == 1;
+
   auto algorithm = CUSPARSE_SPMM_CSR_ALG2;
+  if (deterministic) {
+    // CUSPARSE_SPMM_CSR_ALG3 is the only deterministic CSR SpMM algorithm. It
+    // does not support op(A) transposition, op(B) conjugation, or batching,
+    // and cuSPARSE falls back to an unspecified SpMV algorithm when n == 1.
+    // https://docs.nvidia.com/cuda/cusparse/generic-api/generic-api-functions.html
+    if (at::native::sparse::cuda::spmm_csr_alg3_is_deterministic() &&
+        !single_column && !batched) {
+      algorithm = CUSPARSE_SPMM_CSR_ALG3;
+    } else {
+      at::globalContext().alertNotDeterministic(
+          batched ? "sparse mm (CUDA) with batched inputs" : "sparse mm (CUDA)");
+    }
+  }
 
   auto descB = at::cuda::sparse::CuSparseConstDnMatDescriptor(
       transpose_B ? mat2_->mT() : *mat2_);

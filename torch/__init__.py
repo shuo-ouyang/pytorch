@@ -1804,7 +1804,9 @@ def use_deterministic_algorithms(
         * :class:`torch.nn.ReplicationPad1d` when attempting to differentiate a CUDA tensor
         * :class:`torch.nn.ReplicationPad2d` when attempting to differentiate a CUDA tensor
         * :class:`torch.nn.ReplicationPad3d` when attempting to differentiate a CUDA tensor
-        * :func:`torch.bmm` when called on sparse-dense CUDA tensors
+        * :func:`torch.bmm` when called on sparse-dense CUDA tensors with COO sparse inputs
+        * :func:`torch.sparse.mm`, :func:`torch.sparse.addmm`, and :func:`torch.mm` when
+          called on 2-D CUDA tensors with a sparse operand and more than one dense column
         * :func:`torch.cumsum` when called on a CUDA tensor when dtype is floating point or complex
         * :func:`torch.Tensor.__getitem__` when attempting to differentiate a CPU tensor
           and the index is a list of tensors
@@ -1865,6 +1867,12 @@ def use_deterministic_algorithms(
         * :func:`torch.histc` when called on a CUDA tensor
         * :func:`torch.bincount` when called on a CUDA tensor and ``weights``
           tensor is given
+        * :func:`torch.bmm` and :func:`torch.baddbmm` when called on CUDA tensors
+          with batched CSR inputs
+        * :func:`torch.sparse.mm`, :func:`torch.sparse.addmm`, and :func:`torch.mm`
+          when called on CUDA tensors with a single-column dense operand, or where
+          cuSPARSE only provides non-deterministic SpMM algorithms (ROCm, or CUDA
+          13.0 with more than one dense column)
         * :func:`torch.nn.functional.grid_sample` when attempting to differentiate a CUDA tensor
         * :func:`torch.Tensor.scatter_reduce` when called on a CUDA tensor
         * :func:`torch.Tensor.index_put` with ``accumulate=True`` when called on

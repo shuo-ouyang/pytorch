@@ -8,6 +8,7 @@ import operator
 import random
 import types
 import unittest
+import warnings
 from contextlib import redirect_stderr
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     largeTensorTest,
     onlyAccelerator,
+    onlyCUDA,
     OpDTypes,
     ops,
     precisionOverride,
@@ -50,6 +52,7 @@ from torch.testing._internal.common_methods_invocations import (
 )
 from torch.testing._internal.common_utils import (
     coalescedonoff,
+    DeterministicGuard,
     HardwareClassification,
     IS_FBCODE,
     IS_LINUX,
@@ -2031,6 +2034,113 @@ class TestSparseCSR(TestCase):
         for index_dtype in [torch.int32, torch.int64]:
             test_shape(7, 8, 9, 20, False, index_dtype)
             test_shape(7, 8, 9, 20, True, index_dtype)
+
+    @onlyCUDA
+    @dtypes(torch.float32, torch.float64)
+    @precisionOverride({torch.float32: 1e-4})
+    def test_sparse_mm_deterministic(self, device, dtype):
+        if TEST_WITH_ROCM:
+            self.skipTest("hipSPARSE determinism for SpMM is unverified")
+        cuda_13_0 = (torch.version.cuda or "").startswith("13.0")
+
+        def test_shape(m, k, n, nnz, transposed):
+            if transposed:
+                D = torch.randn(n, k, dtype=dtype, device=device).t_()
+            else:
+                D = torch.randn(k, n, dtype=dtype, device=device)
+            S = self.genSparseCSRTensor((m, k), nnz, device=device, dtype=dtype, index_dtype=torch.int64)
+            with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
+                torch.use_deterministic_algorithms(True)
+                if cuda_13_0:
+                    # CUSPARSE_SPMM_CSR_ALG3 is not deterministic on CUDA 13.0,
+                    # and SpMM is the only option when n > 1.
+                    with self.assertRaisesRegex(RuntimeError, "does not have a deterministic implementation"):
+                        torch.sparse.mm(S, D)
+                    return
+                results = [torch.sparse.mm(S, D) for _ in range(10)]
+            self.assertEqual(results[0], torch.mm(S.to_dense(), D))
+            for result in results[1:]:
+                self.assertEqual(result, results[0], atol=0, rtol=0)
+
+        test_shape(64, 128, 64, 4096, False)
+        test_shape(64, 128, 64, 4096, True)
+        test_shape(200, 300, 40, 20000, False)
+
+    @onlyCUDA
+    @dtypes(torch.float32, torch.float64)
+    def test_sparse_mm_deterministic_single_column_raises(self, device, dtype):
+        # cuSPARSE falls back to an unspecified SpMV algorithm when the dense
+        # operand has a single column, which has no determinism guarantee.
+        S = self.genSparseCSRTensor((64, 128), 2048, device=device, dtype=dtype, index_dtype=torch.int64)
+        D = torch.randn(128, 1, dtype=dtype, device=device)
+        with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
+            torch.use_deterministic_algorithms(True)
+            with self.assertRaisesRegex(RuntimeError, "does not have a deterministic implementation"):
+                torch.sparse.mm(S, D)
+
+    @onlyCUDA
+    @dtypes(torch.float64)
+    def test_sparse_addmm_deterministic(self, device, dtype):
+        if TEST_WITH_ROCM:
+            self.skipTest("hipSPARSE determinism for SpMM is unverified")
+        if (torch.version.cuda or "").startswith("13.0"):
+            self.skipTest("CUSPARSE_SPMM_CSR_ALG3 is not deterministic on CUDA 13.0")
+        S = self.genSparseCSRTensor((64, 128), 4096, device=device, dtype=dtype, index_dtype=torch.int64)
+        D = torch.randn(128, 32, dtype=dtype, device=device)
+        bias = torch.randn(64, 32, dtype=dtype, device=device)
+        with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
+            torch.use_deterministic_algorithms(True)
+            results = [torch.sparse.addmm(bias, S, D, beta=0.5, alpha=2.0) for _ in range(10)]
+        self.assertEqual(results[0], torch.addmm(bias, S.to_dense(), D, beta=0.5, alpha=2.0))
+        for result in results[1:]:
+            self.assertEqual(result, results[0], atol=0, rtol=0)
+
+    @onlyCUDA
+    @dtypes(torch.float64)
+    def test_sparse_addmm_deterministic_noncontiguous_out(self, device, dtype):
+        if TEST_WITH_ROCM:
+            self.skipTest("hipSPARSE determinism for SpMM is unverified")
+        if (torch.version.cuda or "").startswith("13.0"):
+            self.skipTest("CUSPARSE_SPMM_CSR_ALG3 is not deterministic on CUDA 13.0")
+        S = self.genSparseCSRTensor((64, 128), 4096, device=device, dtype=dtype, index_dtype=torch.int64)
+        D = torch.randn(128, 32, dtype=dtype, device=device)
+        out = torch.empty((64, 64), dtype=dtype, device=device)
+        out_view = out[:, :32]
+        zero = torch.zeros(64, 32, dtype=dtype, device=device)
+        with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
+            torch.use_deterministic_algorithms(True)
+            torch.addmm(zero, S, D, out=out_view)
+            first = out_view.clone()
+            torch.addmm(zero, S, D, out=out_view)
+            self.assertEqual(out_view, first, atol=0, rtol=0)
+        self.assertEqual(out_view, torch.mm(S.to_dense(), D))
+
+    @onlyCUDA
+    @dtypes(torch.float64)
+    def test_bmm_deterministic_raises(self, device, dtype):
+        # Batched sparse mm has no deterministic cuSPARSE path: CSR_ALG3 does
+        # not support batched SpMM and SpMV has no batched variant.
+        S = self.genSparseCSRTensor((2, 10, 20), 50, device=device, dtype=dtype, index_dtype=torch.int64)
+        for n in (1, 4):
+            D = torch.randn(2, 20, n, dtype=dtype, device=device)
+            with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
+                torch.use_deterministic_algorithms(True)
+                with self.assertRaisesRegex(RuntimeError, "does not have a deterministic implementation"):
+                    torch.bmm(S, D)
+
+    @onlyCUDA
+    @dtypes(torch.float64)
+    def test_bmm_deterministic_warn_only(self, device, dtype):
+        # Batched sparse mm has no deterministic cuSPARSE path on any platform;
+        # warn_only must downgrade the error to a warning.
+        S = self.genSparseCSRTensor((2, 10, 20), 50, device=device, dtype=dtype, index_dtype=torch.int64)
+        D = torch.randn(2, 20, 4, dtype=dtype, device=device)
+        with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                torch.use_deterministic_algorithms(True, warn_only=True)
+                torch.bmm(S, D)
+        self.assertTrue(any("does not have a deterministic implementation" in str(w.message) for w in caught))
 
     @dtypes(*floating_and_complex_types())
     @dtypesIfCUDA(*floating_and_complex_types_and(

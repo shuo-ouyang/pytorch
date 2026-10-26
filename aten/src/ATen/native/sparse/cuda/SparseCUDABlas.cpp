@@ -1,4 +1,5 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Exception.h>
 #include <ATen/cuda/Exceptions.h>
@@ -53,6 +54,33 @@ void _csrmm2(
     "If you need this, please file an issue on GitHub."
   );
 
+  auto handle = at::cuda::getCurrentCUDASparseHandle();
+  // ALG1 is broken on SM89 as of CUDA 11.8+
+#if !defined(USE_ROCM)
+  cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
+  auto default_alg = prop->major == 8 && prop->minor == 9 ? CUSPARSE_SPMM_CSR_ALG2 : CUSPARSE_SPMM_CSR_ALG1;
+#else
+  auto default_alg = CUSPARSE_SPMM_CSR_ALG1;
+#endif
+
+  // See Note [Enabling Deterministic Operations]
+  const bool deterministic = at::globalContext().deterministicAlgorithms();
+
+  auto alg = default_alg;
+  if (deterministic) {
+    // CUSPARSE_SPMM_CSR_ALG3 is the only deterministic CSR SpMM algorithm.
+    // It does not support op(A) transposition or op(B) conjugation, and
+    // cuSPARSE falls back to an unspecified SpMV algorithm when n == 1.
+    if (spmm_csr_alg3_is_deterministic() &&
+        opa == CUSPARSE_OPERATION_NON_TRANSPOSE &&
+        opb != CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE &&
+        n != 1) {
+      alg = CUSPARSE_SPMM_CSR_ALG3;
+    } else {
+      at::globalContext().alertNotDeterministic("sparse mm (CUDA)");
+    }
+  }
+
   int64_t ma = m, ka = k;
   if (transa != 'n') std::swap(ma, ka);
 
@@ -91,15 +119,6 @@ void _csrmm2(
   ));
 
 
-  auto handle = at::cuda::getCurrentCUDASparseHandle();
-  // ALG1 is broken on SM89 as of CUDA 11.8+
-#if !defined(USE_ROCM)
-  cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
-  auto default_alg = prop->major == 8 && prop->minor == 9 ? CUSPARSE_SPMM_CSR_ALG2 : CUSPARSE_SPMM_CSR_ALG1;
-#else
-  auto default_alg = CUSPARSE_SPMM_CSR_ALG1;
-#endif
-
   // cusparseSpMM_bufferSize returns the bufferSize that can be used by cusparseSpMM
   size_t bufferSize;
   TORCH_CUDASPARSE_CHECK(cusparseSpMM_bufferSize(
@@ -109,7 +128,7 @@ void _csrmm2(
     beta,
     descC,
     cusparse_value_type,      /* data type in which the computation is executed */
-    default_alg,              /* default computing algorithm for CSR sparse matrix format */
+    alg,                      /* computing algorithm for CSR sparse matrix format */
     &bufferSize               /* output */
   ));
 
@@ -123,7 +142,7 @@ void _csrmm2(
     beta,
     descC,
     cusparse_value_type,      /* data type in which the computation is executed */
-    default_alg,              /* default computing algorithm for CSR sparse matrix format */
+    alg,                      /* computing algorithm for CSR sparse matrix format */
     dataPtr.get()             /* external buffer */
   ));
 

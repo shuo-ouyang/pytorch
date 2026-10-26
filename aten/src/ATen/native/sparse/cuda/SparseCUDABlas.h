@@ -4,6 +4,24 @@
 
 namespace at::native::sparse::cuda{
 
+// CUSPARSE_SPMM_CSR_ALG3 is the only CSR SpMM algorithm documented to return
+// bitwise-deterministic results; ALG1 and ALG2 may differ between runs.
+// https://docs.nvidia.com/cuda/cusparse/generic-api/generic-api-functions.html
+// It is broken on CUDA 13.0 and fixed in CUDA 13.1 (CUSPARSE-2612):
+// https://docs.nvidia.com/cuda/archive/13.0.1/cuda-toolkit-release-notes/index.html
+// https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html
+// The determinism of the corresponding hipSPARSE algorithm is unverified.
+inline constexpr bool spmm_csr_alg3_is_deterministic() {
+#if defined(USE_ROCM)
+  return false;
+#elif defined(CUDART_VERSION) && CUDART_VERSION >= 13000 && \
+    CUDART_VERSION < 13010
+  return false;
+#else
+  return true;
+#endif
+}
+
 TORCH_CUDA_CU_API void Xcoo2csr(
     const int* coorowind,
     int64_t nnz,
